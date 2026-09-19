@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const bookingRoutes = require("./routes/bookingRoutes");
 const express = require("express");
 const cors = require("cors");
 const pool = require("./config/database");
@@ -9,6 +10,8 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+app.use("/api/bookings", bookingRoutes);
 
 app.get("/api/health", async (req, res) => {
   try {
