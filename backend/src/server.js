@@ -1,9 +1,9 @@
 require("dotenv").config();
 
 const bookingRoutes = require("./routes/bookingRoutes");
+const courseRoutes = require("./routes/courseRoutes");
 const express = require("express");
 const cors = require("cors");
-const pool = require("./config/database");
 const redisClient = require("./config/redis");
 
 const app = express();
@@ -12,6 +12,7 @@ app.use(cors());
 app.use(express.json());
 
 app.use("/api/bookings", bookingRoutes);
+app.use("/api/courses", courseRoutes);
 
 app.get("/api/health", async (req, res) => {
   try {
@@ -28,19 +29,6 @@ app.get("/api/health", async (req, res) => {
       status: "error",
       redis: "disconnected",
     });
-  }
-});
-
-app.get("/api/courses", async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT * FROM courses ORDER BY id"
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Failed to fetch courses" });
   }
 });
 
