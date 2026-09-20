@@ -16,6 +16,7 @@ const {
 } = require("../services/idempotency");
 
 const router = express.Router();
+
 const ALLOWED_ENVIRONMENTS = new Set(["development", "test"]);
 
 function parseUnsafeDelayMs() {
@@ -34,6 +35,12 @@ function wait(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
+/*
+ * POST /api/bookings/unsafe
+ *
+ * Intentionally unsafe endpoint used for demonstrating
+ * the double-booking race condition.
+ */
 router.post("/unsafe", async (req, res) => {
   const environment = process.env.NODE_ENV || "development";
 
@@ -138,7 +145,9 @@ router.post("/unsafe", async (req, res) => {
       );
     }
 
-    // Intentionally widen the race-condition window.
+    // This delay intentionally widens the race window between
+    // the capacity check and insert.
+    // The unsafe endpoint must not acquire the Redis lock.
     await wait(delayMs);
 
     const bookingResult = await client.query(
@@ -249,6 +258,7 @@ router.get("/", async (_req, res) => {
  * 1. Idempotency protection
  * 2. Redis distributed lock
  * 3. PostgreSQL transaction
+ * 4. Atomic database seat claim
  */
 router.post("/safe", async (req, res) => {
   const { studentId, courseId } = req.body || {};
@@ -281,17 +291,19 @@ router.post("/safe", async (req, res) => {
     );
   }
 
-  // 3. Check whether this logical request was already processed
+  // 3. Check idempotency state
   try {
     const existingRecord =
       await getIdempotencyRecord(idempotencyKey);
 
+    // Same logical request already completed.
     if (existingRecord?.state === "completed") {
       return res
         .status(existingRecord.statusCode)
         .json(existingRecord.response);
     }
 
+    // Same logical request is currently executing.
     if (existingRecord?.state === "processing") {
       return sendError(
         res,
@@ -301,7 +313,7 @@ router.post("/safe", async (req, res) => {
       );
     }
 
-    // Atomically claim the idempotency key.
+    // Atomically claim this idempotency key.
     const claimed =
       await claimIdempotencyKey(idempotencyKey);
 
@@ -336,7 +348,7 @@ router.post("/safe", async (req, res) => {
     lockToken = await acquireLock(lockKey);
 
     if (!lockToken) {
-      // Nothing was committed, so this logical request may be retried.
+      // No booking happened, so allow this request to retry.
       await clearIdempotencyKey(idempotencyKey);
 
       return sendError(
@@ -353,7 +365,7 @@ router.post("/safe", async (req, res) => {
     await client.query("BEGIN");
     transactionStarted = true;
 
-    // 6. Validate student
+    // 6. Validate student before claiming capacity
     const studentResult = await client.query(
       `
       SELECT id
@@ -377,10 +389,13 @@ router.post("/safe", async (req, res) => {
       );
     }
 
-    // 7. Atomically claim one available seat.
-    //
-    // This PostgreSQL operation provides another layer of
-    // protection in addition to the Redis distributed lock.
+    /*
+     * 7. Atomically claim one seat.
+     *
+     * This is the Issue #8 database protection.
+     * It remains safe even if multiple application instances
+     * attempt to update capacity concurrently.
+     */
     const courseClaimResult = await client.query(
       `
       UPDATE courses
@@ -392,7 +407,6 @@ router.post("/safe", async (req, res) => {
       [courseId]
     );
 
-    // No row was updated: either course doesn't exist or is full.
     if (courseClaimResult.rowCount === 0) {
       const courseResult = await client.query(
         `
@@ -427,7 +441,7 @@ router.post("/safe", async (req, res) => {
 
     const course = courseClaimResult.rows[0];
 
-    // 8. Create booking
+    // 8. Insert booking after seat claim succeeds
     const bookingResult = await client.query(
       `
       INSERT INTO bookings (
@@ -453,7 +467,7 @@ router.post("/safe", async (req, res) => {
       booking: bookingResult.rows[0],
     };
 
-    // 10. Remember successful result for duplicate requests
+    // 10. Store successful result for duplicate requests
     await storeIdempotencyResult(
       idempotencyKey,
       201,
@@ -462,7 +476,7 @@ router.post("/safe", async (req, res) => {
 
     return res.status(201).json(responseBody);
   } catch (error) {
-    // Roll back only if transaction is still active.
+    // Roll back unfinished transaction
     if (client && transactionStarted) {
       try {
         await client.query("ROLLBACK");
@@ -476,12 +490,12 @@ router.post("/safe", async (req, res) => {
     }
 
     /*
-     * Clear the idempotency key only when the booking was
-     * NOT committed.
+     * Only clear the idempotency key when PostgreSQL did NOT
+     * commit the booking.
      *
-     * If PostgreSQL committed but storing the completed Redis
-     * record failed, clearing the key could allow another
-     * booking to be created by a retry.
+     * If the database committed but storing the completed
+     * Redis result failed, clearing the key could allow an
+     * immediate retry to create another booking.
      */
     if (!bookingCommitted) {
       try {
@@ -530,12 +544,10 @@ router.post("/safe", async (req, res) => {
       "Failed to create booking"
     );
   } finally {
-    // Return PostgreSQL connection
     if (client) {
       client.release();
     }
 
-    // Always attempt to release Redis course lock
     if (lockToken) {
       try {
         await releaseLock(lockKey, lockToken);
