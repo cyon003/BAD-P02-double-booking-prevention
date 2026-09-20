@@ -8,6 +8,159 @@ const {
 } = require("../services/redisLock");
 
 const router = express.Router();
+const ALLOWED_ENVIRONMENTS = new Set(["development", "test"]);
+
+function parseUnsafeDelayMs() {
+  const rawDelay = process.env.UNSAFE_BOOKING_DELAY_MS ?? "0";
+
+  if (!/^\d+$/.test(rawDelay)) {
+    return null;
+  }
+
+  const delayMs = Number(rawDelay);
+
+  return Number.isSafeInteger(delayMs) ? delayMs : null;
+}
+
+function wait(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+router.post("/unsafe", async (req, res) => {
+  const environment = process.env.NODE_ENV || "development";
+
+  if (!ALLOWED_ENVIRONMENTS.has(environment)) {
+    return sendError(
+      res,
+      403,
+      "UNSAFE_BOOKING_FORBIDDEN",
+      "Unsafe booking is only available in development or test environments"
+    );
+  }
+
+  const { studentId, courseId } = req.body || {};
+
+  if (
+    !Number.isSafeInteger(studentId) ||
+    studentId <= 0 ||
+    !Number.isSafeInteger(courseId) ||
+    courseId <= 0
+  ) {
+    return sendError(
+      res,
+      400,
+      "INVALID_BOOKING_INPUT",
+      "studentId and courseId must be positive integers"
+    );
+  }
+
+  const delayMs = parseUnsafeDelayMs();
+
+  if (delayMs === null) {
+    return sendError(
+      res,
+      500,
+      "UNSAFE_BOOKING_DELAY_INVALID",
+      "UNSAFE_BOOKING_DELAY_MS must be a non-negative integer"
+    );
+  }
+
+  let client;
+
+  try {
+    client = await pool.connect();
+
+    const courseResult = await client.query(
+      `
+      SELECT id, course_code, capacity, available_seats
+      FROM courses
+      WHERE id = $1
+      `,
+      [courseId]
+    );
+
+    if (courseResult.rowCount === 0) {
+      return sendError(res, 404, "COURSE_NOT_FOUND", "Course not found");
+    }
+
+    const studentResult = await client.query(
+      `
+      SELECT id
+      FROM students
+      WHERE id = $1
+      `,
+      [studentId]
+    );
+
+    if (studentResult.rowCount === 0) {
+      return sendError(res, 404, "STUDENT_NOT_FOUND", "Student not found");
+    }
+
+    const course = courseResult.rows[0];
+    const bookingCountResult = await client.query(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM bookings
+      WHERE course_id = $1
+        AND UPPER(status) = 'CONFIRMED'
+      `,
+      [courseId]
+    );
+    const observedBookingCount = bookingCountResult.rows[0].count;
+
+    if (observedBookingCount >= course.capacity) {
+      return sendError(res, 409, "COURSE_FULL", "Course is full");
+    }
+
+    // This delay intentionally widens the race window between the capacity
+    // check and insert. The endpoint must not acquire the Redis lock.
+    await wait(delayMs);
+
+    const bookingResult = await client.query(
+      `
+      INSERT INTO bookings (student_id, course_id, status)
+      VALUES ($1, $2, 'confirmed')
+      RETURNING *
+      `,
+      [studentId, courseId]
+    );
+
+    await client.query(
+      `
+      UPDATE courses
+      SET available_seats = capacity - (
+        SELECT COUNT(*)
+        FROM bookings
+        WHERE course_id = $1
+          AND UPPER(status) = 'CONFIRMED'
+      )
+      WHERE id = $1
+      `,
+      [courseId]
+    );
+
+    return res.status(201).json({
+      message: "Booking successful",
+      unsafe: true,
+      observedBookingCount,
+      capacity: course.capacity,
+      booking: bookingResult.rows[0],
+    });
+  } catch (error) {
+    console.error("Unsafe booking failed:", error);
+
+    return sendError(
+      res,
+      500,
+      "UNSAFE_BOOKING_FAILED",
+      "Failed to create booking"
+    );
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+});
 
 router.get("/", async (_req, res) => {
   try {
