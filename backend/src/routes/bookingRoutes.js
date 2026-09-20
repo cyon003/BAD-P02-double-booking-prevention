@@ -1,12 +1,46 @@
 const express = require("express");
 
 const pool = require("../config/database");
+const { sendError } = require("../utils/httpResponses");
 const {
   acquireLock,
   releaseLock,
 } = require("../services/redisLock");
 
 const router = express.Router();
+
+router.get("/", async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        bookings.id,
+        bookings.student_id,
+        students.name AS student_name,
+        bookings.course_id,
+        courses.course_code,
+        courses.course_name,
+        bookings.status,
+        bookings.created_at
+      FROM bookings
+      JOIN students ON students.id = bookings.student_id
+      JOIN courses ON courses.id = bookings.course_id
+      ORDER BY bookings.created_at DESC, bookings.id DESC
+      `
+    );
+
+    return res.json(result.rows);
+  } catch (error) {
+    console.error("Failed to fetch bookings:", error);
+
+    return sendError(
+      res,
+      500,
+      "BOOKINGS_FETCH_FAILED",
+      "Failed to fetch bookings"
+    );
+  }
+});
 
 router.post("/safe", async (req, res) => {
   const { studentId, courseId } = req.body;
