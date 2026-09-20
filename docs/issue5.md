@@ -106,15 +106,23 @@ node src/concurrentRunner.js --url http://localhost:5051/api/bookings/unsafe --r
 node src/concurrentRunner.js --url http://localhost:5051/api/bookings/safe --requests 20 --course 1
 ```
 
-## Actual Results (20 Concurrent Requests)
+## Results Recording (20 Concurrent Requests)
+
+Record the output from the real development/test database after each run.
+Do not copy expected or historical numbers into this table.
 
 | Test | Requests | Successful | Conflicts | DB Bookings | Capacity | Double Booking |
 |------|----------:|-----------:|----------:|------------:|---------:|----------------|
-| Unsafe | 20 | 10 | 10 | 10 | 1 | YES |
-| Safe | 20 | 1 | 19 | 1 | 1 | NO |
+| Unsafe | 20 | 2 | 18 | 2 | 1 | YES |
+| Safe | pending | pending | pending | pending | pending | pending |
 
-* **Unsafe Conclusion:** The lack of a distributed lock allowed 10 requests to read `capacity > bookings` simultaneously before any of them could update it. This resulted in 10 actual database records being inserted, violating the capacity constraint (FAIL).
-* **Safe Conclusion:** The Redis lock forced the requests to process sequentially or fail fast. Only 1 request acquired the lock and inserted a record. The remaining 19 requests failed safely (PASS).
+Before each run, call `POST /api/test/reset`, then record the runner output
+and the final database state returned by the read APIs.
+
+The unsafe row was recorded from the Neon development run on 2026-09-21
+with `UNSAFE_BOOKING_DELAY_MS=1000`. The runner alternates two students, so
+the database unique constraint rejects duplicate student/course attempts;
+the authoritative booking count still exceeded the course capacity.
 
 ## Done When Checklist
 - [x] Requests are actually sent concurrently.

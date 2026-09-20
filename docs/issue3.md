@@ -70,3 +70,23 @@ A normal single booking works.
 Concurrent requests can be sent to it.
 
 Final bookings can be checked using the booking read API.
+
+Experiment setup
+
+Call `POST /api/test/reset` before each run. Set
+`UNSAFE_BOOKING_DELAY_MS` to widen the gap between the capacity check and
+the insert when reproducing the race condition.
+
+Verified Neon development run (20 requests, 2026-09-21)
+
+- Successful bookings: 2
+- Conflicts: 18
+- Other errors: 0
+- Final confirmed bookings: 2
+- Capacity: 1
+- Double booking detected: YES
+
+The runner alternates between two students, and the database's unique
+student/course constraint turns duplicate attempts into conflicts. The
+authoritative database count still exceeded capacity, confirming the
+unsafe race condition.
