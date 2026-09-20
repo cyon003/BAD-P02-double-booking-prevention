@@ -7,7 +7,7 @@ the same state.
 
 Endpoint
 
-POST /api/experiment/reset
+POST /api/test/reset
 
 Required Starting State
 
@@ -64,3 +64,8 @@ Course availability returns to the agreed starting value.
 The endpoint returns the new/reset state.
 
 Testing and frontend can call the endpoint.
+
+Frontend handoff
+
+Use `POST /api/test/reset`. Replace any existing `/api/experiment/reset`
+calls with the canonical `/api/test/reset` path.
