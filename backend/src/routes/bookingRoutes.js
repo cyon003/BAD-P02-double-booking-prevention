@@ -1,6 +1,7 @@
 const express = require("express");
 
 const pool = require("../config/database");
+const { sendError } = require("../utils/httpResponses");
 const {
   acquireLock,
   releaseLock,
@@ -32,9 +33,12 @@ router.get("/", async (_req, res) => {
   } catch (error) {
     console.error("Failed to fetch bookings:", error);
 
-    return res.status(500).json({
-      error: "Failed to fetch bookings",
-    });
+    return sendError(
+      res,
+      500,
+      "BOOKINGS_FETCH_FAILED",
+      "Failed to fetch bookings"
+    );
   }
 });
 

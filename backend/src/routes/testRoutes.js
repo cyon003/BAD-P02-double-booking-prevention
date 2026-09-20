@@ -1,22 +1,28 @@
 const express = require("express");
 
 const pool = require("../config/database");
+const { sendError } = require("../utils/httpResponses");
+const { parsePositiveInteger } = require("../utils/validation");
 
 const router = express.Router();
 
 router.get("/results", async (req, res) => {
   const rawCourseId = req.query.courseId ?? process.env.EXPERIMENT_COURSE_ID;
-  const courseId = Number(rawCourseId);
+  const courseId = parsePositiveInteger(rawCourseId);
 
-  if (!Number.isInteger(courseId) || courseId <= 0) {
+  if (courseId === null) {
     const status = req.query.courseId === undefined ? 500 : 400;
 
-    return res.status(status).json({
-      error:
-        status === 500
-          ? "EXPERIMENT_COURSE_ID is not configured"
-          : "courseId must be a positive integer",
-    });
+    return sendError(
+      res,
+      status,
+      status === 500
+        ? "EXPERIMENT_COURSE_NOT_CONFIGURED"
+        : "INVALID_COURSE_ID",
+      status === 500
+        ? "EXPERIMENT_COURSE_ID is not configured"
+        : "courseId must be a positive integer"
+    );
   }
 
   try {
@@ -40,9 +46,12 @@ router.get("/results", async (req, res) => {
     );
 
     if (result.rowCount === 0) {
-      return res.status(404).json({
-        error: "Experiment course not found",
-      });
+      return sendError(
+        res,
+        404,
+        "EXPERIMENT_COURSE_NOT_FOUND",
+        "Experiment course not found"
+      );
     }
 
     const course = result.rows[0];
@@ -64,9 +73,12 @@ router.get("/results", async (req, res) => {
   } catch (error) {
     console.error("Failed to fetch test results:", error);
 
-    return res.status(500).json({
-      error: "Failed to fetch test results",
-    });
+    return sendError(
+      res,
+      500,
+      "TEST_RESULTS_FETCH_FAILED",
+      "Failed to fetch test results"
+    );
   }
 });
 

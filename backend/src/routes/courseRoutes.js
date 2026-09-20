@@ -1,6 +1,8 @@
 const express = require("express");
 
 const pool = require("../config/database");
+const { sendError } = require("../utils/httpResponses");
+const { parsePositiveInteger } = require("../utils/validation");
 
 const router = express.Router();
 
@@ -18,19 +20,25 @@ router.get("/", async (_req, res) => {
   } catch (error) {
     console.error("Failed to fetch courses:", error);
 
-    return res.status(500).json({
-      error: "Failed to fetch courses",
-    });
+    return sendError(
+      res,
+      500,
+      "COURSES_FETCH_FAILED",
+      "Failed to fetch courses"
+    );
   }
 });
 
 router.get("/:courseId", async (req, res) => {
-  const courseId = Number(req.params.courseId);
+  const courseId = parsePositiveInteger(req.params.courseId);
 
-  if (!Number.isInteger(courseId) || courseId <= 0) {
-    return res.status(400).json({
-      error: "courseId must be a positive integer",
-    });
+  if (courseId === null) {
+    return sendError(
+      res,
+      400,
+      "INVALID_COURSE_ID",
+      "courseId must be a positive integer"
+    );
   }
 
   try {
@@ -44,18 +52,19 @@ router.get("/:courseId", async (req, res) => {
     );
 
     if (result.rowCount === 0) {
-      return res.status(404).json({
-        error: "Course not found",
-      });
+      return sendError(res, 404, "COURSE_NOT_FOUND", "Course not found");
     }
 
     return res.json(result.rows[0]);
   } catch (error) {
     console.error("Failed to fetch course:", error);
 
-    return res.status(500).json({
-      error: "Failed to fetch course",
-    });
+    return sendError(
+      res,
+      500,
+      "COURSE_FETCH_FAILED",
+      "Failed to fetch course"
+    );
   }
 });
 

@@ -6,6 +6,7 @@ const testRoutes = require("./routes/testRoutes");
 const express = require("express");
 const cors = require("cors");
 const redisClient = require("./config/redis");
+const { sendError } = require("./utils/httpResponses");
 
 const app = express();
 
@@ -32,6 +33,25 @@ app.get("/api/health", async (req, res) => {
       redis: "disconnected",
     });
   }
+});
+
+app.use((req, res) => {
+  return sendError(res, 404, "ROUTE_NOT_FOUND", "Route not found");
+});
+
+app.use((error, _req, res, _next) => {
+  if (error instanceof SyntaxError && error.status === 400 && "body" in error) {
+    return sendError(res, 400, "INVALID_JSON", "Request body is not valid JSON");
+  }
+
+  console.error("Unhandled request error:", error);
+
+  return sendError(
+    res,
+    500,
+    "INTERNAL_SERVER_ERROR",
+    "An unexpected error occurred"
+  );
 });
 
 const PORT = process.env.PORT || 5050;
