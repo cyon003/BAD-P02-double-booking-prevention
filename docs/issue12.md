@@ -49,7 +49,7 @@ The frontend will use the backend APIs, including:
 
 GET  /api/courses
 GET  /api/bookings
-POST /api/experiment/reset
+POST /api/test/reset
 POST /api/bookings/unsafe
 POST /api/bookings/safe
 

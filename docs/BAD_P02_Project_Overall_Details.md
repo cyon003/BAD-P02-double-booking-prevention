@@ -359,7 +359,7 @@ Demonstrate the solution.
 ### Experiment Reset
 
 ``` http
-POST /api/experiment/reset
+POST /api/test/reset
 ```
 
 Restores the agreed test course and booking data to the initial state.
