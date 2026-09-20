@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const bookingRoutes = require("./routes/bookingRoutes");
 const courseRoutes = require("./routes/courseRoutes");
+const testRoutes = require("./routes/testRoutes");
 const express = require("express");
 const cors = require("cors");
 const redisClient = require("./config/redis");
@@ -13,6 +14,7 @@ app.use(express.json());
 
 app.use("/api/bookings", bookingRoutes);
 app.use("/api/courses", courseRoutes);
+app.use("/api/test", testRoutes);
 
 app.get("/api/health", async (req, res) => {
   try {
