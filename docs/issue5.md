@@ -113,11 +113,16 @@ Do not copy expected or historical numbers into this table.
 
 | Test | Requests | Successful | Conflicts | DB Bookings | Capacity | Double Booking |
 |------|----------:|-----------:|----------:|------------:|---------:|----------------|
-| Unsafe | pending | pending | pending | pending | pending | pending |
+| Unsafe | 20 | 2 | 18 | 2 | 1 | YES |
 | Safe | pending | pending | pending | pending | pending | pending |
 
 Before each run, call `POST /api/test/reset`, then record the runner output
 and the final database state returned by the read APIs.
+
+The unsafe row was recorded from the Neon development run on 2026-09-21
+with `UNSAFE_BOOKING_DELAY_MS=1000`. The runner alternates two students, so
+the database unique constraint rejects duplicate student/course attempts;
+the authoritative booking count still exceeded the course capacity.
 
 ## Done When Checklist
 - [x] Requests are actually sent concurrently.
