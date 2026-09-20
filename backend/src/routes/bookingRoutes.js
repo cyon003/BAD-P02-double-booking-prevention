@@ -128,11 +128,14 @@ router.post("/unsafe", async (req, res) => {
     await client.query(
       `
       UPDATE courses
-      SET available_seats = capacity - (
-        SELECT COUNT(*)
-        FROM bookings
-        WHERE course_id = $1
-          AND UPPER(status) = 'CONFIRMED'
+      SET available_seats = GREATEST(
+        capacity - (
+          SELECT COUNT(*)
+          FROM bookings
+          WHERE course_id = $1
+            AND UPPER(status) = 'CONFIRMED'
+        ),
+        0
       )
       WHERE id = $1
       `,
@@ -147,6 +150,15 @@ router.post("/unsafe", async (req, res) => {
       booking: bookingResult.rows[0],
     });
   } catch (error) {
+    if (error.code === "23505") {
+      return sendError(
+        res,
+        409,
+        "BOOKING_ALREADY_EXISTS",
+        "Student already has a booking for this course"
+      );
+    }
+
     console.error("Unsafe booking failed:", error);
 
     return sendError(
