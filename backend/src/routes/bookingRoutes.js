@@ -2,12 +2,21 @@ const express = require("express");
 
 const pool = require("../config/database");
 const { sendError } = require("../utils/httpResponses");
+
 const {
   acquireLock,
   releaseLock,
 } = require("../services/redisLock");
 
+const {
+  getIdempotencyRecord,
+  claimIdempotencyKey,
+  storeIdempotencyResult,
+  clearIdempotencyKey,
+} = require("../services/idempotency");
+
 const router = express.Router();
+
 const ALLOWED_ENVIRONMENTS = new Set(["development", "test"]);
 
 function parseUnsafeDelayMs() {
@@ -26,6 +35,12 @@ function wait(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
+/*
+ * POST /api/bookings/unsafe
+ *
+ * Intentionally unsafe endpoint used for demonstrating
+ * the double-booking race condition.
+ */
 router.post("/unsafe", async (req, res) => {
   const environment = process.env.NODE_ENV || "development";
 
@@ -80,7 +95,12 @@ router.post("/unsafe", async (req, res) => {
     );
 
     if (courseResult.rowCount === 0) {
-      return sendError(res, 404, "COURSE_NOT_FOUND", "Course not found");
+      return sendError(
+        res,
+        404,
+        "COURSE_NOT_FOUND",
+        "Course not found"
+      );
     }
 
     const studentResult = await client.query(
@@ -93,10 +113,16 @@ router.post("/unsafe", async (req, res) => {
     );
 
     if (studentResult.rowCount === 0) {
-      return sendError(res, 404, "STUDENT_NOT_FOUND", "Student not found");
+      return sendError(
+        res,
+        404,
+        "STUDENT_NOT_FOUND",
+        "Student not found"
+      );
     }
 
     const course = courseResult.rows[0];
+
     const bookingCountResult = await client.query(
       `
       SELECT COUNT(*)::int AS count
@@ -106,19 +132,31 @@ router.post("/unsafe", async (req, res) => {
       `,
       [courseId]
     );
-    const observedBookingCount = bookingCountResult.rows[0].count;
+
+    const observedBookingCount =
+      bookingCountResult.rows[0].count;
 
     if (observedBookingCount >= course.capacity) {
-      return sendError(res, 409, "COURSE_FULL", "Course is full");
+      return sendError(
+        res,
+        409,
+        "COURSE_FULL",
+        "Course is full"
+      );
     }
 
-    // This delay intentionally widens the race window between the capacity
-    // check and insert. The endpoint must not acquire the Redis lock.
+    // This delay intentionally widens the race window between
+    // the capacity check and insert.
+    // The unsafe endpoint must not acquire the Redis lock.
     await wait(delayMs);
 
     const bookingResult = await client.query(
       `
-      INSERT INTO bookings (student_id, course_id, status)
+      INSERT INTO bookings (
+        student_id,
+        course_id,
+        status
+      )
       VALUES ($1, $2, 'confirmed')
       RETURNING *
       `,
@@ -174,6 +212,11 @@ router.post("/unsafe", async (req, res) => {
   }
 });
 
+/*
+ * GET /api/bookings
+ *
+ * Return all bookings.
+ */
 router.get("/", async (_req, res) => {
   try {
     const result = await pool.query(
@@ -207,9 +250,33 @@ router.get("/", async (_req, res) => {
   }
 });
 
+/*
+ * POST /api/bookings/safe
+ *
+ * Safe booking endpoint using:
+ *
+ * 1. Idempotency protection
+ * 2. Redis distributed lock
+ * 3. PostgreSQL transaction
+ * 4. Atomic database seat claim
+ */
 router.post("/safe", async (req, res) => {
   const { studentId, courseId } = req.body || {};
+  const rawIdempotencyKey = req.get("Idempotency-Key");
 
+  // 1. Validate idempotency key
+  if (!rawIdempotencyKey || !rawIdempotencyKey.trim()) {
+    return sendError(
+      res,
+      400,
+      "IDEMPOTENCY_KEY_REQUIRED",
+      "Idempotency-Key header is required"
+    );
+  }
+
+  const idempotencyKey = rawIdempotencyKey.trim();
+
+  // 2. Validate booking input
   if (
     !Number.isSafeInteger(studentId) ||
     studentId <= 0 ||
@@ -224,30 +291,81 @@ router.post("/safe", async (req, res) => {
     );
   }
 
-  // 2. Create one lock for this course
+  // 3. Check idempotency state
+  try {
+    const existingRecord =
+      await getIdempotencyRecord(idempotencyKey);
+
+    // Same logical request already completed.
+    if (existingRecord?.state === "completed") {
+      return res
+        .status(existingRecord.statusCode)
+        .json(existingRecord.response);
+    }
+
+    // Same logical request is currently executing.
+    if (existingRecord?.state === "processing") {
+      return sendError(
+        res,
+        409,
+        "IDEMPOTENCY_REQUEST_IN_PROGRESS",
+        "This booking request is already being processed"
+      );
+    }
+
+    // Atomically claim this idempotency key.
+    const claimed =
+      await claimIdempotencyKey(idempotencyKey);
+
+    if (!claimed) {
+      return sendError(
+        res,
+        409,
+        "IDEMPOTENCY_REQUEST_IN_PROGRESS",
+        "This booking request is already being processed"
+      );
+    }
+  } catch (error) {
+    console.error("Idempotency check failed:", error);
+
+    return sendError(
+      res,
+      500,
+      "IDEMPOTENCY_CHECK_FAILED",
+      "Failed to process idempotency key"
+    );
+  }
+
   const lockKey = `booking:course:${courseId}`;
+
   let lockToken = null;
   let client = null;
   let transactionStarted = false;
+  let bookingCommitted = false;
 
   try {
-    // 3. Try to acquire Redis lock
+    // 4. Acquire Redis distributed lock
     lockToken = await acquireLock(lockKey);
 
     if (!lockToken) {
-      return res.status(409).json({
-        error: "Booking is currently being processed. Please try again.",
-      });
+      // No booking happened, so allow this request to retry.
+      await clearIdempotencyKey(idempotencyKey);
+
+      return sendError(
+        res,
+        409,
+        "BOOKING_IN_PROGRESS",
+        "Booking is currently being processed. Please try again."
+      );
     }
 
-    // 4. Get a dedicated Neon/PostgreSQL connection
+    // 5. Start PostgreSQL transaction
     client = await pool.connect();
 
-    // 5. Start a transaction before reading or changing protected state.
     await client.query("BEGIN");
     transactionStarted = true;
 
-    // 6. Validate the student before claiming capacity.
+    // 6. Validate student before claiming capacity
     const studentResult = await client.query(
       `
       SELECT id
@@ -261,11 +379,23 @@ router.post("/safe", async (req, res) => {
       await client.query("ROLLBACK");
       transactionStarted = false;
 
-      return sendError(res, 404, "STUDENT_NOT_FOUND", "Student not found");
+      await clearIdempotencyKey(idempotencyKey);
+
+      return sendError(
+        res,
+        404,
+        "STUDENT_NOT_FOUND",
+        "Student not found"
+      );
     }
 
-    // 7. Claim one seat atomically. This remains safe if Redis is unavailable
-    // or multiple application instances execute this statement concurrently.
+    /*
+     * 7. Atomically claim one seat.
+     *
+     * This is the Issue #8 database protection.
+     * It remains safe even if multiple application instances
+     * attempt to update capacity concurrently.
+     */
     const courseClaimResult = await client.query(
       `
       UPDATE courses
@@ -286,46 +416,95 @@ router.post("/safe", async (req, res) => {
         `,
         [courseId]
       );
+
       await client.query("ROLLBACK");
       transactionStarted = false;
 
+      await clearIdempotencyKey(idempotencyKey);
+
       if (courseResult.rowCount === 0) {
-        return sendError(res, 404, "COURSE_NOT_FOUND", "Course not found");
+        return sendError(
+          res,
+          404,
+          "COURSE_NOT_FOUND",
+          "Course not found"
+        );
       }
 
-      return sendError(res, 409, "COURSE_FULL", "Course is full");
+      return sendError(
+        res,
+        409,
+        "COURSE_FULL",
+        "Course is full"
+      );
     }
 
     const course = courseClaimResult.rows[0];
 
-    // 8. Insert only after the atomic capacity claim succeeds.
+    // 8. Insert booking after seat claim succeeds
     const bookingResult = await client.query(
       `
-      INSERT INTO bookings (student_id, course_id, status)
+      INSERT INTO bookings (
+        student_id,
+        course_id,
+        status
+      )
       VALUES ($1, $2, 'confirmed')
       RETURNING *
       `,
       [studentId, courseId]
     );
 
-    // 9. Commit the seat claim and booking together.
+    // 9. Commit seat claim and booking together
     await client.query("COMMIT");
-    transactionStarted = false;
 
-    return res.status(201).json({
+    transactionStarted = false;
+    bookingCommitted = true;
+
+    const responseBody = {
       message: "Booking successful",
       course,
       booking: bookingResult.rows[0],
-    });
+    };
 
+    // 10. Store successful result for duplicate requests
+    await storeIdempotencyResult(
+      idempotencyKey,
+      201,
+      responseBody
+    );
+
+    return res.status(201).json(responseBody);
   } catch (error) {
-    // Undo both the seat claim and booking if either operation failed.
+    // Roll back unfinished transaction
     if (client && transactionStarted) {
       try {
         await client.query("ROLLBACK");
         transactionStarted = false;
       } catch (rollbackError) {
-        console.error("Rollback failed:", rollbackError);
+        console.error(
+          "Rollback failed:",
+          rollbackError
+        );
+      }
+    }
+
+    /*
+     * Only clear the idempotency key when PostgreSQL did NOT
+     * commit the booking.
+     *
+     * If the database committed but storing the completed
+     * Redis result failed, clearing the key could allow an
+     * immediate retry to create another booking.
+     */
+    if (!bookingCommitted) {
+      try {
+        await clearIdempotencyKey(idempotencyKey);
+      } catch (clearError) {
+        console.error(
+          "Failed to clear idempotency key:",
+          clearError
+        );
       }
     }
 
@@ -364,19 +543,19 @@ router.post("/safe", async (req, res) => {
       "SAFE_BOOKING_FAILED",
       "Failed to create booking"
     );
-
   } finally {
-    // Return PostgreSQL connection
     if (client) {
       client.release();
     }
 
-    // ALWAYS attempt to release Redis lock
     if (lockToken) {
       try {
         await releaseLock(lockKey, lockToken);
       } catch (releaseError) {
-        console.error("Failed to release booking lock:", releaseError);
+        console.error(
+          "Failed to release booking lock:",
+          releaseError
+        );
       }
     }
   }
