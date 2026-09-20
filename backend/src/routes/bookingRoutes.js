@@ -208,19 +208,27 @@ router.get("/", async (_req, res) => {
 });
 
 router.post("/safe", async (req, res) => {
-  const { studentId, courseId } = req.body;
+  const { studentId, courseId } = req.body || {};
 
-  // 1. Validate input
-  if (!Number.isInteger(studentId) || !Number.isInteger(courseId)) {
-    return res.status(400).json({
-      error: "studentId and courseId must be integers",
-    });
+  if (
+    !Number.isSafeInteger(studentId) ||
+    studentId <= 0 ||
+    !Number.isSafeInteger(courseId) ||
+    courseId <= 0
+  ) {
+    return sendError(
+      res,
+      400,
+      "INVALID_BOOKING_INPUT",
+      "studentId and courseId must be positive integers"
+    );
   }
 
   // 2. Create one lock for this course
   const lockKey = `booking:course:${courseId}`;
   let lockToken = null;
   let client = null;
+  let transactionStarted = false;
 
   try {
     // 3. Try to acquire Redis lock
@@ -235,52 +243,11 @@ router.post("/safe", async (req, res) => {
     // 4. Get a dedicated Neon/PostgreSQL connection
     client = await pool.connect();
 
-    // 5. Start database transaction
+    // 5. Start a transaction before reading or changing protected state.
     await client.query("BEGIN");
+    transactionStarted = true;
 
-    // 6. Read latest course state AFTER acquiring Redis lock
-    const courseResult = await client.query(
-      `
-      SELECT id, course_code, capacity, available_seats
-      FROM courses
-      WHERE id = $1
-      `,
-      [courseId]
-    );
-
-    if (courseResult.rowCount === 0) {
-      await client.query("ROLLBACK");
-
-      return res.status(404).json({
-        error: "Course not found",
-      });
-    }
-
-    const course = courseResult.rows[0];
-
-    // 7. Count the latest confirmed bookings from Neon
-    const bookingCountResult = await client.query(
-      `
-      SELECT COUNT(*)::int AS count
-      FROM bookings
-      WHERE course_id = $1
-        AND status = 'confirmed'
-      `,
-      [courseId]
-    );
-
-    const currentBookings = bookingCountResult.rows[0].count;
-
-    // 8. Check capacity using Neon as source of truth
-    if (currentBookings >= course.capacity) {
-      await client.query("ROLLBACK");
-
-      return res.status(409).json({
-        error: "Course is full",
-      });
-    }
-
-    // 9. Make sure the student exists
+    // 6. Validate the student before claiming capacity.
     const studentResult = await client.query(
       `
       SELECT id
@@ -292,13 +259,46 @@ router.post("/safe", async (req, res) => {
 
     if (studentResult.rowCount === 0) {
       await client.query("ROLLBACK");
+      transactionStarted = false;
 
-      return res.status(404).json({
-        error: "Student not found",
-      });
+      return sendError(res, 404, "STUDENT_NOT_FOUND", "Student not found");
     }
 
-    // 10. Store the booking
+    // 7. Claim one seat atomically. This remains safe if Redis is unavailable
+    // or multiple application instances execute this statement concurrently.
+    const courseClaimResult = await client.query(
+      `
+      UPDATE courses
+      SET available_seats = available_seats - 1
+      WHERE id = $1
+        AND available_seats > 0
+      RETURNING *
+      `,
+      [courseId]
+    );
+
+    if (courseClaimResult.rowCount === 0) {
+      const courseResult = await client.query(
+        `
+        SELECT id
+        FROM courses
+        WHERE id = $1
+        `,
+        [courseId]
+      );
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+
+      if (courseResult.rowCount === 0) {
+        return sendError(res, 404, "COURSE_NOT_FOUND", "Course not found");
+      }
+
+      return sendError(res, 409, "COURSE_FULL", "Course is full");
+    }
+
+    const course = courseClaimResult.rows[0];
+
+    // 8. Insert only after the atomic capacity claim succeeds.
     const bookingResult = await client.query(
       `
       INSERT INTO bookings (student_id, course_id, status)
@@ -308,44 +308,62 @@ router.post("/safe", async (req, res) => {
       [studentId, courseId]
     );
 
-    // 11. Keep available_seats synchronized
-    await client.query(
-      `
-      UPDATE courses
-      SET available_seats = capacity - (
-        SELECT COUNT(*)
-        FROM bookings
-        WHERE course_id = $1
-          AND status = 'confirmed'
-      )
-      WHERE id = $1
-      `,
-      [courseId]
-    );
-
-    // 12. Commit both changes
+    // 9. Commit the seat claim and booking together.
     await client.query("COMMIT");
+    transactionStarted = false;
 
     return res.status(201).json({
       message: "Booking successful",
+      course,
       booking: bookingResult.rows[0],
     });
 
   } catch (error) {
-    // Undo uncommitted database changes if something failed
-    if (client) {
+    // Undo both the seat claim and booking if either operation failed.
+    if (client && transactionStarted) {
       try {
         await client.query("ROLLBACK");
+        transactionStarted = false;
       } catch (rollbackError) {
         console.error("Rollback failed:", rollbackError);
       }
     }
 
+    if (error.code === "23505") {
+      return sendError(
+        res,
+        409,
+        "BOOKING_ALREADY_EXISTS",
+        "Student already has a booking for this course"
+      );
+    }
+
+    if (error.code === "23514") {
+      return sendError(
+        res,
+        409,
+        "BOOKING_CAPACITY_CONSTRAINT",
+        "Booking would violate the course capacity constraints"
+      );
+    }
+
+    if (error.code === "23503") {
+      return sendError(
+        res,
+        409,
+        "BOOKING_REFERENCE_INVALID",
+        "Booking references a record that does not exist"
+      );
+    }
+
     console.error("Safe booking failed:", error);
 
-    return res.status(500).json({
-      error: "Failed to create booking",
-    });
+    return sendError(
+      res,
+      500,
+      "SAFE_BOOKING_FAILED",
+      "Failed to create booking"
+    );
 
   } finally {
     // Return PostgreSQL connection
