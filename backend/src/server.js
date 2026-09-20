@@ -41,7 +41,12 @@ app.use((req, res) => {
 
 app.use((error, _req, res, _next) => {
   if (error instanceof SyntaxError && error.status === 400 && "body" in error) {
-    return sendError(res, 400, "INVALID_JSON", "Request body is not valid JSON");
+    return sendError(
+      res,
+      400,
+      "INVALID_JSON",
+      "Request body is not valid JSON"
+    );
   }
 
   console.error("Unhandled request error:", error);

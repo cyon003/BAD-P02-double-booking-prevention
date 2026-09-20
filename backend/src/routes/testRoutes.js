@@ -19,12 +19,14 @@ function getExperimentCourseId() {
   return Number.isSafeInteger(courseId) && courseId > 0 ? courseId : null;
 }
 
+// Reset experiment
 router.post("/reset", async (req, res) => {
   const environment = process.env.NODE_ENV || "development";
 
   if (!ALLOWED_ENVIRONMENTS.has(environment)) {
     return res.status(403).json({
-      error: "Experiment reset is only available in development or test environments",
+      error:
+        "Experiment reset is only available in development or test environments",
     });
   }
 
@@ -109,6 +111,7 @@ router.post("/reset", async (req, res) => {
   }
 });
 
+// Get experiment results
 router.get("/results", async (req, res) => {
   const rawCourseId = req.query.courseId ?? process.env.EXPERIMENT_COURSE_ID;
   const courseId = parsePositiveInteger(rawCourseId);
