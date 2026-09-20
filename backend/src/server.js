@@ -1,10 +1,12 @@
 require("dotenv").config();
 
 const bookingRoutes = require("./routes/bookingRoutes");
+const courseRoutes = require("./routes/courseRoutes");
+const testRoutes = require("./routes/testRoutes");
 const express = require("express");
 const cors = require("cors");
-const pool = require("./config/database");
 const redisClient = require("./config/redis");
+const { sendError } = require("./utils/httpResponses");
 
 const app = express();
 
@@ -12,6 +14,8 @@ app.use(cors());
 app.use(express.json());
 
 app.use("/api/bookings", bookingRoutes);
+app.use("/api/courses", courseRoutes);
+app.use("/api/test", testRoutes);
 
 app.get("/api/health", async (req, res) => {
   try {
@@ -31,17 +35,23 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
-app.get("/api/courses", async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT * FROM courses ORDER BY id"
-    );
+app.use((req, res) => {
+  return sendError(res, 404, "ROUTE_NOT_FOUND", "Route not found");
+});
 
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Failed to fetch courses" });
+app.use((error, _req, res, _next) => {
+  if (error instanceof SyntaxError && error.status === 400 && "body" in error) {
+    return sendError(res, 400, "INVALID_JSON", "Request body is not valid JSON");
   }
+
+  console.error("Unhandled request error:", error);
+
+  return sendError(
+    res,
+    500,
+    "INTERNAL_SERVER_ERROR",
+    "An unexpected error occurred"
+  );
 });
 
 const PORT = process.env.PORT || 5050;
