@@ -18,7 +18,6 @@ jest.mock("pg", () => {
 const app = require("../src/server");
 const pool = require("../src/config/database");
 const redisClient = require("../src/config/redis");
-const { clearIdempotencyKey } = require("../src/services/idempotency");
 
 describe("Issue #10 Automated Tests", () => {
   const EXPERIMENT_COURSE_ID = 1;
@@ -47,6 +46,34 @@ describe("Issue #10 Automated Tests", () => {
   }
 
   const getUniqueIdempotencyKey = () => `test-key-${Date.now()}-${Math.random()}`;
+
+  describe("Experiment reset regression", () => {
+    it("seeds all 15 distinct demo students and returns a fresh run namespace", async () => {
+      const first = await resetExperiment();
+      const second = await resetExperiment();
+      expect(second.runId).not.toBe(first.runId);
+      expect(second.studentIds).toEqual(Array.from({ length: 15 }, (_, i) => i + 1));
+      const students = await pool.query("SELECT id FROM students WHERE id BETWEEN 1 AND 15 ORDER BY id");
+      expect(students.rows.map(row => row.id)).toEqual(second.studentIds);
+      const response = await request(app).post("/api/bookings/safe")
+        .set("Idempotency-Key", `${second.runId}:3`)
+        .send({ studentId: 3, courseId: EXPERIMENT_COURSE_ID });
+      expect(response.status).toBe(201);
+    });
+
+    it("does not remove an active booking lock during reset", async () => {
+      const key = `booking:course:${EXPERIMENT_COURSE_ID}`;
+      await redisClient.set(key, "reset-test-owner", { EX: 10 });
+      try {
+        const response = await request(app).post("/api/test/reset");
+        expect(response.status).toBe(409);
+        expect(response.body.error.code).toBe("BOOKING_IN_PROGRESS");
+        expect(await redisClient.get(key)).toBe("reset-test-owner");
+      } finally {
+        await redisClient.del(key);
+      }
+    });
+  });
 
   describe("TEST 1 - Successful booking", () => {
     it("should successfully book a course and update the database", async () => {

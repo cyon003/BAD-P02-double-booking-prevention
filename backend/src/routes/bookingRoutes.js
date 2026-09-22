@@ -20,7 +20,7 @@ const router = express.Router();
 const ALLOWED_ENVIRONMENTS = new Set(["development", "test"]);
 
 function parseUnsafeDelayMs() {
-  const rawDelay = process.env.UNSAFE_BOOKING_DELAY_MS ?? "0";
+  const rawDelay = process.env.UNSAFE_BOOKING_DELAY_MS ?? "100";
 
   if (!/^\d+$/.test(rawDelay)) {
     return null;

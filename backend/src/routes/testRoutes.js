@@ -1,8 +1,10 @@
 const express = require("express");
+const { randomUUID } = require("crypto");
 
 const pool = require("../config/database");
 const { sendError } = require("../utils/httpResponses");
 const { parsePositiveInteger } = require("../utils/validation");
+const { acquireLock, releaseLock } = require("../services/redisLock");
 
 const router = express.Router();
 const ALLOWED_ENVIRONMENTS = new Set(["development", "test"]);
@@ -39,8 +41,15 @@ router.post("/reset", async (req, res) => {
   }
 
   let client;
+  let lockToken;
+  const lockKey = `booking:course:${experimentCourseId}`;
 
   try {
+    // Never delete another request's live lock to make a reset succeed.
+    lockToken = await acquireLock(lockKey);
+    if (!lockToken) {
+      return sendError(res, 409, "BOOKING_IN_PROGRESS", "Wait for the active booking before resetting");
+    }
     client = await pool.connect();
     await client.query("BEGIN");
 
@@ -72,6 +81,20 @@ router.post("/reset", async (req, res) => {
       [experimentCourseId]
     );
 
+    // The demo sends distinct students 1–15. Preserve existing student data.
+    await client.query(`
+      INSERT INTO students (id, name, email)
+      SELECT id, 'Demo Student ' || id, 'booking-demo-' || id || '@example.test'
+      FROM generate_series(1, 15) AS id
+      ON CONFLICT (id) DO NOTHING
+    `);
+    // Explicit seed IDs must not collide with future generated IDs.
+    await client.query(`
+      SELECT setval(pg_get_serial_sequence('students', 'id'),
+        GREATEST((SELECT MAX(id) FROM students),
+          nextval(pg_get_serial_sequence('students', 'id'))))
+    `);
+
     const resetCourseResult = await client.query(
       `
       UPDATE courses
@@ -84,11 +107,17 @@ router.post("/reset", async (req, res) => {
 
     await client.query("COMMIT");
 
+    await releaseLock(lockKey, lockToken);
+    lockToken = null;
+
     return res.json({
       message: "Experiment reset successfully",
       course: resetCourseResult.rows[0],
       bookingCount: 0,
       deletedBookingCount: deletedBookingsResult.rowCount,
+      studentIds: Array.from({ length: 15 }, (_, i) => i + 1),
+      // A fresh namespace prevents replaying cached results from an older run.
+      runId: randomUUID(),
     });
   } catch (error) {
     if (client) {
@@ -107,6 +136,11 @@ router.post("/reset", async (req, res) => {
   } finally {
     if (client) {
       client.release();
+    }
+    if (lockToken) {
+      await releaseLock(lockKey, lockToken).catch((error) => {
+        console.error("Failed to release experiment lock:", error);
+      });
     }
   }
 });
@@ -174,6 +208,8 @@ router.get("/results", async (req, res) => {
         confirmed_bookings: course.confirmed_bookings,
         double_booking_detected:
           course.confirmed_bookings > course.capacity,
+        seat_count_consistent:
+          course.available_seats === course.capacity - course.confirmed_bookings,
       },
     });
   } catch (error) {

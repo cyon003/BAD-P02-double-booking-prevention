@@ -23,38 +23,47 @@ const crypto = require("crypto");
 
 async function sendBooking(requestNumber) {
   // Deterministically cycle through students 1-15
-  const studentId = (requestNumber % 15) + 1;
+  const studentId = ((requestNumber - 1) % 15) + 1;
   const idempotencyKey = crypto.randomUUID();
   const startTime = performance.now();
   
   try {
-    const response = await fetch(targetUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Idempotency-Key": idempotencyKey
-      },
-      body: JSON.stringify({
-        studentId,
-        courseId,
-      }),
-    });
+    let response;
+    let data;
+    let rawText;
+    const attempts = [];
+    const deadline = Date.now() + 15000;
+    do {
+      response = await fetch(targetUrl, {
+        signal: AbortSignal.timeout(15000),
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey,
+        },
+        body: JSON.stringify({ studentId, courseId }),
+      });
 
-    const endTime = performance.now();
-    let data = {};
-    let rawText = "";
-    try {
+      data = {};
       rawText = await response.text();
-      data = JSON.parse(rawText);
-    } catch (e) {
-      // not JSON
-    }
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        // Keep non-JSON error responses visible in the report.
+      }
+
+      attempts.push(`${response.status} ${data.error?.code || data.message || 'Unknown'}`);
+      if (response.status !== 409 || data.error?.code !== "BOOKING_IN_PROGRESS" || Date.now() >= deadline) break;
+      await new Promise(resolve => setTimeout(resolve, 100 + Math.random() * 200));
+    } while (true);
+    const endTime = performance.now();
 
     return {
+      attempts,
       request: requestNumber,
       status: response.status,
       responseTime: endTime - startTime,
-      result: data.message || data.error || rawText.substring(0, 50) || 'Unknown',
+      result: data.error?.code || data.message || data.error || rawText.substring(0, 50) || 'Unknown',
     };
   } catch (error) {
     const endTime = performance.now();
@@ -81,8 +90,8 @@ async function runTest() {
   const endTime = performance.now();
 
   const successfulBookings = results.filter((r) => r.status === 201);
-  const failedBookings = results.filter((r) => r.status === 409 || r.status === 400 || r.status === 404);
-  const errors = results.filter((r) => r.status === "ERROR" || r.status === 500);
+  const failedBookings = results.filter((r) => Number.isInteger(r.status) && r.status >= 400 && r.status < 500);
+  const errors = results.filter((r) => r.status === "ERROR" || r.status >= 500);
 
   if (failedBookings.length > 0) {
     console.log("First failed booking result:", failedBookings[0].result, "Status:", failedBookings[0].status);
@@ -90,6 +99,14 @@ async function runTest() {
   if (errors.length > 0) {
     console.log("First error result:", errors[0].result, "Status:", errors[0].status);
   }
+
+  const categories = {};
+  for (const result of results) {
+    const label = `${result.status} ${result.result}`;
+    categories[label] = (categories[label] || 0) + 1;
+  }
+  console.table(categories);
+  console.log("HTTP attempts (including contention retries):", results.reduce((n, r) => n + (r.attempts?.length || 1), 0));
 
   // Calculate average response time
   const totalResponseTime = results.reduce((sum, r) => sum + r.responseTime, 0);
@@ -129,7 +146,7 @@ async function runTest() {
       ssl: process.env.DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false }
     });
 
-    const courseRes = await pool.query("SELECT capacity FROM courses WHERE id = $1", [courseId]);
+    const courseRes = await pool.query("SELECT capacity, available_seats FROM courses WHERE id = $1", [courseId]);
     if (courseRes.rowCount === 0) {
       console.log("\nFINAL RESULT: FAIL (Course not found in database)");
       await pool.end();
@@ -138,7 +155,7 @@ async function runTest() {
     const capacity = courseRes.rows[0].capacity;
 
     const bookingRes = await pool.query(
-      "SELECT COUNT(*) as count FROM bookings WHERE course_id = $1 AND status = 'confirmed'",
+      "SELECT COUNT(*) as count FROM bookings WHERE course_id = $1 AND UPPER(status) = 'CONFIRMED'",
       [courseId]
     );
     const dbBookings = parseInt(bookingRes.rows[0].count, 10);
@@ -148,6 +165,11 @@ async function runTest() {
     console.log(`Course Capacity: ${capacity}`);
     console.log(`Actual Bookings in DB: ${dbBookings}`);
 
+    console.log(`Remaining seats: ${courseRes.rows[0].available_seats}`);
+    if (successfulBookings.length === 0 || courseRes.rows[0].available_seats !== capacity - dbBookings) {
+      pass = false;
+      console.log("No bookings succeeded or seat accounting is inconsistent; inspect response categories.");
+    }
     if (dbBookings > capacity) {
       pass = false;
       console.log(`Mismatch: Bookings (${dbBookings}) exceed capacity (${capacity})!`);
