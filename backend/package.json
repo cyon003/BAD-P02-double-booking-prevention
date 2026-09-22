@@ -6,7 +6,7 @@
     "test": "tests"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "jest",
     "start": "node src/server.js",
     "dev": "nodemon src/server.js"
   },
@@ -21,7 +21,9 @@
     "redis": "^6.2.1"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "jest": "^30.5.2",
+    "nodemon": "^3.1.14",
+    "supertest": "^7.2.2"
   },
   "description": ""
 }
