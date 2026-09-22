@@ -83,8 +83,8 @@ router.post("/reset", async (req, res) => {
 
     // The demo sends distinct students 1–15. Preserve existing student data.
     await client.query(`
-      INSERT INTO students (id, name, email)
-      SELECT id, 'Demo Student ' || id, 'booking-demo-' || id || '@example.test'
+      INSERT INTO students (id, name)
+      SELECT id, 'Demo Student ' || id
       FROM generate_series(1, 15) AS id
       ON CONFLICT (id) DO NOTHING
     `);
@@ -171,7 +171,6 @@ router.get("/results", async (req, res) => {
       SELECT
         courses.id,
         courses.course_code,
-        courses.course_name,
         courses.capacity,
         courses.available_seats,
         COUNT(bookings.id) FILTER (
@@ -200,7 +199,6 @@ router.get("/results", async (req, res) => {
       course: {
         id: course.id,
         course_code: course.course_code,
-        course_name: course.course_name,
         capacity: course.capacity,
         available_seats: course.available_seats,
       },
