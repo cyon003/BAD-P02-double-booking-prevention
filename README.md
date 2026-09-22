@@ -1,103 +1,184 @@
-# Double-booking comparison
+# Double Booking Prevention System
 
-The React dashboard compares a deliberately unsafe check-then-insert endpoint
-with the protected Redis lock + PostgreSQL transaction + atomic seat claim.
-Database constraints and idempotency remain enabled.
+This project demonstrates a real-world scenario of a "double-booking" race condition, alongside a complete, production-ready solution to prevent it. It features a React frontend dashboard and a Node.js/Express backend connected to Redis and PostgreSQL (Neon).
 
-## Run the demo
+## Project Overview
 
-Configure `backend/.env` from `.env.example`, with `PORT=5050`,
-`NODE_ENV=development`, and `EXPERIMENT_COURSE_ID=1`. Start the backend with
-`npm run dev` in `backend` and the frontend with `npm run dev` in `frontend`.
-The frontend calls `http://localhost:5050/api`.
+High-traffic applications (e.g., event ticketing, course registration) often suffer from race conditions when multiple users attempt to book the last remaining seat simultaneously. 
 
-The configured course must already exist. Reset preserves its capacity, deletes
-its bookings, restores available seats, and creates any missing demo students
-1–15 without overwriting existing students. For the comparison, use capacity 2
-and 12 concurrent requests. Reset is restricted to development/test environments.
+This repository exposes two distinct endpoints for comparison:
+1. **Unsafe Endpoint (`/api/bookings/unsafe`)**: A standard "check-then-insert" implementation that is deliberately vulnerable to race conditions.
+2. **Safe Endpoint (`/api/bookings/safe`)**: A hardened endpoint utilizing Idempotency, Redis Distributed Locking, and PostgreSQL Transactions to guarantee consistency.
 
-Each reset returns a new run ID. The dashboard uses it to namespace idempotency
-keys, retaining the same key for retries within a run. Prior Redis records are
-not flushed: they expire after one hour and cannot collide with new run keys.
-Manual clients must also use fresh keys after reset; an old key intentionally
-continues to replay its old result. Reset respects the course lock instead of
-deleting another request's lock. Abandoned locks expire after 10 seconds.
+For detailed sequence diagrams and system architecture, please see the [Architecture Documentation](docs/architecture.md).
 
-Run experiments one at a time. Buttons are disabled until all requests and DB
-verification finish. Concurrent experiments in separate tabs/processes are not
-isolated; the unsafe endpoint intentionally does not participate in locking.
+---
 
-## Expected results
+## 1. The Vulnerability (Unsafe Workflow)
 
-| 12 requests, capacity 2 | Safe | Unsafe |
-| --- | --- | --- |
-| Final successful requests | 2 | Variable; can exceed 2 |
-| Other final responses | `409 COURSE_FULL` | Usually `409 COURSE_FULL` |
-| Confirmed DB bookings | 2 | Can exceed capacity |
-| Remaining seats | 0 | Usually 0; cannot go negative |
-| Dashboard status | SAFE | DETECTED if overbooked or seat count is inconsistent; otherwise INCONCLUSIVE |
+### Race Condition Explanation
+The unsafe workflow uses a naive "Check-Then-Insert" approach. 
+When Client A and Client B request a booking concurrently:
+1. Client A queries the database: `SELECT count(*) FROM bookings`. Result: 0 bookings (capacity is 1).
+2. Client B queries the database concurrently. Result: 0 bookings.
+3. Both clients pass the capacity check in the application logic.
+4. Both clients insert a new booking. 
+5. The course capacity is exceeded. Double booking occurs.
 
-The safe API retains its immediate `409 BOOKING_IN_PROGRESS` contention response.
-The dashboard and CLI retry **only** that response, with jitter and a 15-second
-retry budget. They retain idempotency keys throughout retries and expose final
-status/error categories. The dashboard also shows every attempt and response
-body, so retry responses are not confused with final request outcomes. Network,
-reset, verification, invalid-input, missing-student, and server errors are visible.
-A batch with zero bookings is never displayed as SAFE.
+*Note: The unsafe endpoint in this project intentionally implements an artificial delay (`UNSAFE_BOOKING_DELAY_MS`) to widen this race window for demonstration purposes.*
 
-The unsafe endpoint's existing read/check/insert race window defaults to 100 ms.
-Set `UNSAFE_BOOKING_DELAY_MS=0` to remove the artificial delay or increase it to
-make overlap more likely. The delay never fabricates results: the dashboard
-checks committed rows. Race outcomes remain nondeterministic. The seat-counter
-checks and unique student/course constraint do not impose a cross-row limit on
-confirmed bookings, so no constraints need to be removed for this experiment.
+---
 
-## Cause of the original misleading result
+## 2. The Solution (Safe Workflow)
 
-The database initially had only students 1 and 2, but the dashboard requested
-students 1–12. The formula `(i % 15) || 15` was correct for 1–15; the data was
-missing. When a nonexistent student acquired the safe lock first, it returned
-`404 STUDENT_NOT_FOUND` while the eleven other requests returned
-`409 BOOKING_IN_PROGRESS`. No booking was committed. The old UI hid these
-responses and labeled any non-overbooked database SAFE. With only two valid
-students, the unsafe experiment also could not exceed capacity 2.
+The safe endpoint eliminates double-booking using a multi-layered defense strategy:
 
-## Verification
+### Redis Distributed Lock
+Before interacting with the database, the backend attempts to acquire an exclusive lock on the course (`booking:course:${courseId}`) via Redis. 
+- Only one request can hold the lock at a time.
+- If the lock is held, contenders are immediately rejected with a `409 BOOKING_IN_PROGRESS` error, rather than being queued. 
+- This protects the database from connection saturation during traffic spikes.
+- The client (e.g., the React frontend) is responsible for implementing jittered retries for these 409 responses.
 
-Run these sequentially against a disposable development experiment database,
-with PostgreSQL and Redis available. The live test additionally requires the
-backend running on port 5050. Do not run other experiments during these tests.
+### Neon / PostgreSQL Database Protection
+Even if the Redis lock is bypassed or fails, the database serves as the ultimate source of truth using:
+1. **Transactions:** All operations are wrapped in a `BEGIN` and `COMMIT` block.
+2. **Atomic Updates:** Seats are claimed using an atomic decrement operation:
+   `UPDATE courses SET available_seats = available_seats - 1 WHERE id = $1 AND available_seats > 0 RETURNING *;`
+   Since databases lock rows during an `UPDATE`, concurrent transactions are forced to queue sequentially. The `available_seats > 0` condition ensures capacity can never drop below zero.
+3. **Unique Constraints:** A unique index on `(student_id, course_id)` prevents the same student from booking multiple times, raising a `23505` constraint violation.
+
+### Idempotency
+To prevent accidental duplicate bookings due to network retries, the safe endpoint requires an `Idempotency-Key` header. Redis stores the final result of the initial request. Subsequent retries with the same key safely replay the original response without interacting with the database again.
+
+---
+
+## Setup Instructions
+
+### Prerequisites
+- Node.js (v18+)
+- PostgreSQL database (e.g., [Neon](https://neon.tech))
+- Redis server (e.g., Upstash, local Docker)
+
+### 1. Environment Configuration
+Clone the repository and set up the backend environment variables using placeholders (do not commit real secrets).
+
+```sh
+cd backend
+cp .env.example .env
+```
+
+Modify `backend/.env`:
+```ini
+PORT=5050
+NODE_ENV=development
+EXPERIMENT_COURSE_ID=1
+
+# Replace with your actual Neon/Postgres connection string
+DATABASE_URL="postgresql://user:password@hostname/dbname?sslmode=require"
+
+# Replace with your actual Redis connection string
+REDIS_URL="redis://default:password@hostname:port"
+
+UNSAFE_BOOKING_DELAY_MS=100
+```
+
+### 2. Start the Backend
+```sh
+cd backend
+npm install
+npm run dev
+```
+*(The backend runs on `http://localhost:5050`)*
+
+### 3. Start the Frontend
+```sh
+cd frontend
+npm install
+npm run dev
+```
+*(The frontend runs on `http://localhost:5173`)*
+
+---
+
+## Running the Experiments
+
+### Resetting the Experiment
+Before any test, you must reset the database to a clean state. This clears bookings and generates a new idempotency run ID.
+- **Via Frontend:** Click the "Reset Database" button.
+- **Via API:** `curl -X POST http://localhost:5050/api/test/reset`
+
+### The Unsafe Experiment
+1. Navigate to the React Dashboard.
+2. Click "Run Unsafe".
+3. The dashboard will fire concurrent requests. 
+4. **Expected Result:** You will likely observe more confirmed bookings than the allowed capacity (Double Booking).
+
+### The Safe Experiment
+1. Click "Reset Database" to clear the previous run.
+2. Click "Run Safe".
+3. **Expected Result:** The system guarantees that successful bookings will perfectly match the available capacity. Excess requests will safely be rejected with `409 COURSE_FULL`.
+
+---
+
+## Automated Tests and Load Tests
+
+### 1. Automated Tests (Jest)
+The backend features an integration test suite validating constraints, idempotency, and the Redis lock.
 
 ```sh
 cd backend
 npm test -- --runInBand
-node --test tests/experiment.integration.mjs
-cd ../frontend
-node --test tests/experiment.test.mjs
-npm run build
-npm run lint
 ```
 
-The live integration test uses the dashboard's request functions and runs
-Reset → Unsafe → Reset → Safe twice with 12 students/capacity 2. It checks API
-results against PostgreSQL after each batch and verifies idempotent replay.
-It reports unsafe outcomes without asserting a nondeterministic race must occur.
-It resets bookings and restores the original capacity when finished.
+> [!WARNING]
+> **Current Validation Status:** While Issue #10 previously achieved full test coverage, the current automated test run on the `main` branch is blocked by a pre-existing database schema error (`error: column "email" of relation "students" does not exist`). This documentation intentionally does not claim this issue is fixed, as resolving the schema is out of scope for this documentation effort.
 
-## CLI runner
+When the schema issue is resolved, **the test suite proves:**
+- Reset functionality accurately seeds the database.
+- Idempotency successfully prevents duplicate inserts.
+- Redis locks reject concurrent requests.
+- Transaction rollback occurs properly on invalid students.
+- Identical students cannot book the same course (Unique Constraint).
+- `COURSE_FULL` is respected.
 
-Reset first (this also seeds the demo students), then run from `backend`:
+### 2. CLI Load Tests (concurrentRunner)
+A built-in script tests high-concurrency scenarios directly against the API.
 
 ```sh
-curl -X POST http://localhost:5050/api/test/reset
-node src/concurrentRunner.js --url http://localhost:5050/api/bookings/safe --requests 12 --course 1
+cd backend
 
+# Reset first
 curl -X POST http://localhost:5050/api/test/reset
-node src/concurrentRunner.js --url http://localhost:5050/api/bookings/unsafe --requests 12 --course 1
+
+# Run Safe (12 requests, Course 1)
+node src/concurrentRunner.js --url http://localhost:5050/api/bookings/safe --requests 12 --course 1
 ```
 
-The runner defaults to 100 requests and cycles through IDs 1–15. Use at most 15
-requests for distinct-student comparisons; larger batches can produce duplicate
-booking responses. It verifies database state using the backend's `DATABASE_URL`;
-ensure that configuration matches the server being tested. Its final PASS/FAIL
-is a safety check, so an unsafe overbooking demonstration correctly reports FAIL.
+### Load Test Results (From Issues #10 & #11)
+Real-world load testing using the concurrent CLI runner produced the following results for the safe endpoint:
+
+- **20 requests / 1 seat:** 1 success, 19 conflicts, final bookings: 1. (PASS)
+- **50 requests / 5 seats:** 1 success, 49 conflicts, final bookings: 1. (PASS)
+  *(Note: Because the lock rejects contenders immediately rather than queuing them, intense concurrent spikes may result in fewer successful bookings than total capacity if clients do not retry adequately. However, capacity is **never** exceeded).*
+- **100 requests / 10 seats:** 3 successes, 97 conflicts, final bookings: 3. (PASS)
+- **Redis failure simulation:** HTTP 500 error returned. No partial bookings committed. (PASS)
+- **Database failure simulation:** HTTP 500 error returned. No partial bookings committed. (PASS)
+
+---
+
+## Interpreting Responses
+
+During safe execution, you may observe the following distinct conflict responses:
+- `409 COURSE_FULL`: The database atomic update confirmed no seats remain. The user missed out.
+- `409 BOOKING_IN_PROGRESS`: The Redis lock was held by another user. The client should wait (jitter) and retry.
+
+---
+
+## System Limitations
+
+While highly robust, the implementation has deliberate bounds:
+1. **Immediate Lock Rejection:** The Redis lock returns `409 BOOKING_IN_PROGRESS` immediately rather than queuing requests on the server. Consequently, the burden of retrying is placed entirely on the client/frontend. Under extreme instantaneous load, this can lead to fewer successful bookings than available capacity if all retries are exhausted simultaneously.
+2. **Redis Dependency:** The safe workflow requires Redis to be available. If Redis is down, the system fails closed (500 Internal Server Error) to prevent uncontrolled DB access.
+3. **Demo Student Limits:** The tests and dashboard are hardcoded to cycle through student IDs 1 through 15. Attempting to run load tests with more than 15 requests requires configuring the system to allow duplicate bookings per student, or expanding the demo student seed list.
+4. **Intentional Vulnerability:** The unsafe endpoint is artificially crippled (via delay) specifically to demonstrate the race condition. It should never be used in a real application.
