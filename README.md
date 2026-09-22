@@ -131,11 +131,8 @@ cd backend
 npm test -- --runInBand
 ```
 
-> [!WARNING]
-> **Current Validation Status:** While Issue #10 previously achieved full test coverage, the current automated test run on the `main` branch is blocked by a pre-existing database schema error (`error: column "email" of relation "students" does not exist`). This documentation intentionally does not claim this issue is fixed, as resolving the schema is out of scope for this documentation effort.
-
-When the schema issue is resolved, **the test suite proves:**
-- Reset functionality accurately seeds the database.
+**What it proves:**
+- Reset functionality accurately seeds the database (with compatibility fix for missing email column).
 - Idempotency successfully prevents duplicate inserts.
 - Redis locks reject concurrent requests.
 - Transaction rollback occurs properly on invalid students.
